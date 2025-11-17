@@ -31,7 +31,7 @@ python attention.py
 ```
 This prints attention weight matrices, demonstrates softmax stability with and without scaling, and shows the output vectors.
 
-OUTPUT :
+**OUTPUT** :
 
 <img width="576" height="442" alt="image" src="https://github.com/user-attachments/assets/f0b090e3-e809-430c-b5e0-3e9c62ed11d6" />
 
@@ -42,7 +42,7 @@ python mini_transformer.py
 ```
 This runs on 10 toy sentences, prints final contextual embeddings (first token of each sentence), and writes `attention_heatmap.png` to the current directory.
 
-OUTPUT :
+**OUTPUT** :
 
 <img width="1081" height="835" alt="image" src="https://github.com/user-attachments/assets/c7526a65-3ddc-4efd-997d-30e9bc97de31" />
 
@@ -53,5 +53,7 @@ python train_rnn.py --data_path data/tiny_corpus.txt --epochs 10 --hidden_size 1
 ```
 - The script includes a toy "hello/help" corpus by default if `--data_path` is not provided.
 - Saved outputs: `rnn_train_loss.png`, `rnn_val_loss.png`, and `rnn_samples.txt` containing three samples at temperatures 0.7, 1.0, and 1.2.
--OUTPUT:
+
+**OUTPUT**:
+
 - <img width="781" height="685" alt="image" src="https://github.com/user-attachments/assets/e9479590-7cec-45db-bbd9-f7df9cb03573" />
