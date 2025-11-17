@@ -1,10 +1,5 @@
-# Student: 700769576 Name: Veera Ganga Godina
 
----
-
-# FILE: README.md
-# ----------------
-# Character-Level RNN Language Model & Mini Transformer Encoder
+# Character-Level RNN Language Model, Mini Transformer Encoder & Dot-Product-Attention
 
 ## Student info
 - Student ID: 700769576
