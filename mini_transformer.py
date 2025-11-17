@@ -5,132 +5,144 @@ Produces attention heatmaps.
 Run: python mini_transformer.py
 """
 
+import torch
+import torch.nn as nn
 import math
 import numpy as np
 import matplotlib.pyplot as plt
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-# ---------------- Positional Encoding ----------------
-class PositionalEncoding(nn.Module):
+
+class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer('pe', pe.unsqueeze(0))  # (1, max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model % 2 == 1:
+            # last column will remain zero for odd dim
+            pe[:, 1::2] = torch.cos(position * div_term[:(d_model//2)])
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
+        # x: (batch, seq_len, d_model)
+        x = x + self.pe[:, :x.size(1)]
+        return x
 
-# ---------------- Multi-head Self-Attention ----------------
-class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
+
+class SimpleMultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads):
         super().__init__()
-        assert d_model % num_heads == 0
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
+        assert d_model % n_heads == 0
+        self.d_k = d_model // n_heads
+        self.n_heads = n_heads
         self.q_lin = nn.Linear(d_model, d_model)
         self.k_lin = nn.Linear(d_model, d_model)
         self.v_lin = nn.Linear(d_model, d_model)
         self.out_lin = nn.Linear(d_model, d_model)
 
     def forward(self, x):
-        B, T, D = x.size()
-        Q = self.q_lin(x).view(B, T, self.num_heads, self.d_k).transpose(1,2)  # (B, H, T, d_k)
-        K = self.k_lin(x).view(B, T, self.num_heads, self.d_k).transpose(1,2)
-        V = self.v_lin(x).view(B, T, self.num_heads, self.d_k).transpose(1,2)
+        # x: (batch, seq_len, d_model)
+        batch, seq_len, d_model = x.size()
+        Q = self.q_lin(x).view(batch, seq_len, self.n_heads, self.d_k).transpose(1,2)  # (b, h, seq, d_k)
+        K = self.k_lin(x).view(batch, seq_len, self.n_heads, self.d_k).transpose(1,2)
+        V = self.v_lin(x).view(batch, seq_len, self.n_heads, self.d_k).transpose(1,2)
 
-        scores = torch.matmul(Q, K.transpose(-2,-1)) / math.sqrt(self.d_k)  # (B,H,T,T)
+        scores = torch.matmul(Q, K.transpose(-2,-1)) / math.sqrt(self.d_k)
         attn = torch.softmax(scores, dim=-1)
-        context = torch.matmul(attn, V)  # (B, H, T, d_k)
-        context = context.transpose(1,2).contiguous().view(B, T, D)
-        out = self.out_lin(context)
-        return out, attn  # return attention for visualization
+        out = torch.matmul(attn, V)  # (b, h, seq, d_k)
+        out = out.transpose(1,2).contiguous().view(batch, seq_len, d_model)
+        return self.out_lin(out), attn
 
-# ---------------- Transformer Block ----------------
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads, ff_hidden=256):
+
+class MiniTransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model=64, n_heads=4, dim_ff=256, dropout=0.1):
         super().__init__()
-        self.attn = MultiHeadSelfAttention(d_model, num_heads)
+        self.mha = SimpleMultiHeadAttention(d_model, n_heads)
         self.norm1 = nn.LayerNorm(d_model)
         self.ff = nn.Sequential(
-            nn.Linear(d_model, ff_hidden),
+            nn.Linear(d_model, dim_ff),
             nn.ReLU(),
-            nn.Linear(ff_hidden, d_model)
+            nn.Linear(dim_ff, d_model)
         )
         self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        attn_out, attn_weights = self.attn(x)
-        x = self.norm1(x + attn_out)
+        mha_out, attn = self.mha(x)
+        x = self.norm1(x + self.dropout(mha_out))
         ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
-        return x, attn_weights
+        x = self.norm2(x + self.dropout(ff_out))
+        return x, attn
 
-# ---------------- Simple tokenizer & demo ----------------
-def simple_tokenizer(sentences):
-    # whitespace tokenizer + build vocab
-    tokens = [s.strip().split() for s in sentences]
-    vocab = {}
-    idx = 0
-    for sent in tokens:
-        for w in sent:
+
+# Toy dataset of 10 sentences
+SENTENCES = [
+    "the cat sat on the mat",
+    "a quick brown fox",
+    "hello world",
+    "transformers are powerful",
+    "attention is all you need",
+    "i like pizza",
+    "we study nlp",
+    "this is a test",
+    "deep learning rocks",
+    "sequence models matter"
+]
+
+
+def simple_tokenize(sentences):
+    # map each unique word to an index
+    toks = []
+    vocab = {"<pad>":0, "<unk>":1}
+    for s in sentences:
+        words = s.lower().split()
+        toks.append(words)
+        for w in words:
             if w not in vocab:
-                vocab[w] = idx; idx+=1
-    inv_vocab = {v:k for k,v in vocab.items()}
-    token_ids = [[vocab[w] for w in s] for s in tokens]
-    return token_ids, vocab, inv_vocab
+                vocab[w] = len(vocab)
+    return toks, vocab
 
-def pad_batch(token_ids, pad_id=0):
-    maxlen = max(len(t) for t in token_ids)
-    batch = []
-    for t in token_ids:
-        padded = t + [pad_id]*(maxlen - len(t))
-        batch.append(padded)
-    return torch.tensor(batch, dtype=torch.long)
-
-def main():
-    sentences = [
-        "I love natural language processing",
-        "This class is interesting",
-        "I love learning about transformers",
-        "Do you like transformers"
-    ]
-    token_ids, vocab, inv_vocab = simple_tokenizer(sentences)
-    pad_id = 0
-    vocab_size = len(vocab)
-    # ensure pad token exists
-    if '<pad>' not in vocab:
-        vocab['<pad>'] = vocab_size; pad_id = vocab_size; vocab_size += 1
-        inv_vocab[pad_id] = '<pad>'
-
-    batch = pad_batch(token_ids, pad_id=pad_id)
-    B, T = batch.size()
-    d_model = 64
-    emb = nn.Embedding(vocab_size, d_model)
-    pos = PositionalEncoding(d_model, max_len=100)
-    block = TransformerBlock(d_model, num_heads=4)
-    x = emb(batch)  # (B,T,D)
-    x = pos(x)
-    out, attn = block(x)  # attn: (B, H, T, T)
-    print("Input tokens:")
-    for i, s in enumerate(sentences):
-        print(i, s)
-    print("Final contextual embeddings shape:", out.shape)
-
-    # visualize attention of head 0 for first sentence
-    attn_np = attn[0, 0].detach().numpy()  # (T,T) for first batch, head 0
-    plt.imshow(attn_np, interpolation='nearest')
-    plt.title("Attention heatmap (batch0, head0)")
-    plt.xlabel("Key position")
-    plt.ylabel("Query position")
-    plt.colorbar()
-    plt.savefig('attention_heatmap.png')
-    print("Saved attention_heatmap.png")
 
 if __name__ == '__main__':
-    main()
+    torch.manual_seed(0)
+    toks, vocab = simple_tokenize(SENTENCES)
+    max_len = max(len(x) for x in toks)
+    d_model = 64
+
+    # create input batch
+    batch = len(toks)
+    input_ids = torch.zeros(batch, max_len, dtype=torch.long)
+    for i, words in enumerate(toks):
+        for j, w in enumerate(words):
+            input_ids[i,j] = vocab.get(w, vocab["<unk>"])
+
+    emb = nn.Embedding(len(vocab), d_model)
+    pos = SinusoidalPositionalEncoding(d_model, max_len=500)
+    encoder = MiniTransformerEncoderLayer(d_model=d_model, n_heads=4, dim_ff=128)
+
+    x = emb(input_ids)  # (batch, seq, d_model)
+    x = pos(x)
+    out, attn = encoder(x)
+
+    # print final contextual embeddings for first token of each sentence
+    print("Final contextual embeddings (first token) for each sentence:")
+    for i in range(batch):
+        print(f"Sentence {i+1}: {SENTENCES[i]} -> embedding[:8] =", out[i,0,:8].detach().numpy())
+
+    # attn shape: (batch, heads, seq, seq)
+    # We'll visualize averaged attention over heads for the first example
+    attn_avg = attn.mean(dim=1).detach().numpy()  # (batch, seq, seq)
+    example_idx = 0
+    heat = attn_avg[example_idx]
+
+    plt.imshow(heat, cmap='viridis')
+    plt.title(f"Attention heatmap (averaged heads) - example {example_idx}")
+    plt.xlabel('Key position')
+    plt.ylabel('Query position')
+    plt.colorbar()
+    plt.savefig('attention_heatmap.png')
+    print('Saved attention heatmap to attention_heatmap.png')
