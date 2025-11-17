@@ -1,4 +1,4 @@
-# Student: 700769576 Name: veera Ganga Godina
+# Student: 700769576 Name: Veera Ganga Godina
 
 ---
 
