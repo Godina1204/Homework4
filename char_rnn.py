@@ -6,156 +6,144 @@ Run: python char_rnn.py --data_file small.txt
 """
 
 import argparse
-import random
-import math
-from collections import Counter
-import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+import numpy as np
+import random
+from tqdm import trange
+import matplotlib.pyplot as plt
 
-# -------------- Dataset --------------
-class CharDataset(Dataset):
-    def __init__(self, text, seq_len):
-        self.chars = sorted(list(set(text)))
-        self.vocab_size = len(self.chars)
-        self stoi = {ch:i for i,ch in enumerate(self.chars)}
-        self.itos = {i:ch for ch,i in self.stoi.items()}
-        self.data = [self.stoi[c] for c in text]
-        self.seq_len = seq_len
 
-    def __len__(self):
-        return max(0, len(self.data) - self.seq_len)
-
-    def __getitem__(self, idx):
-        x = torch.tensor(self.data[idx:idx+self.seq_len], dtype=torch.long)
-        y = torch.tensor(self.data[idx+1:idx+self.seq_len+1], dtype=torch.long)
-        return x, y
-
-# -------------- Model --------------
 class CharRNN(nn.Module):
-    def __init__(self, vocab_size, emb_size=64, hidden_size=128, num_layers=1):
+    def __init__(self, vocab_size, emb_size=32, hidden_size=128, rnn_type='gru'):
         super().__init__()
-        self.embedding = nn.Embedding(vocab_size, emb_size)
-        self.lstm = nn.LSTM(emb_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, vocab_size)
+        self.emb = nn.Embedding(vocab_size, emb_size)
+        if rnn_type.lower() == 'gru':
+            self.rnn = nn.GRU(emb_size, hidden_size, batch_first=True)
+        elif rnn_type.lower() == 'lstm':
+            self.rnn = nn.LSTM(emb_size, hidden_size, batch_first=True)
+        else:
+            self.rnn = nn.RNN(emb_size, hidden_size, batch_first=True)
+        self.lin = nn.Linear(hidden_size, vocab_size)
 
     def forward(self, x, hidden=None):
-        emb = self.embedding(x)                  # (B, T, E)
-        out, hidden = self.lstm(emb, hidden)     # out: (B, T, H)
-        logits = self.fc(out)                    # (B, T, V)
+        # x: (batch, seq)
+        e = self.emb(x)
+        out, hidden = self.rnn(e, hidden)
+        logits = self.lin(out)
         return logits, hidden
 
-# -------------- Sampling --------------
-def sample(model, dataset, device, start_char=None, length=200, temp=1.0):
+
+def build_vocab(text):
+    chars = sorted(list(set(text)))
+    stoi = {c:i for i,c in enumerate(chars)}
+    itos = {i:c for c,i in stoi.items()}
+    return stoi, itos
+
+
+def create_batches(text, seq_len, batch_size, stoi):
+    # convert to indices
+    data = [stoi[c] for c in text]
+    num_batches = len(data) // (seq_len * batch_size)
+    if num_batches == 0:
+        raise ValueError('Not enough data. Reduce seq_len or batch_size or provide more text.')
+    data = data[:num_batches * batch_size * seq_len]
+    arr = np.array(data).reshape(batch_size, -1)
+    for i in range(0, arr.shape[1], seq_len):
+        x = arr[:, i:i+seq_len]
+        y = np.zeros_like(x)
+        y[:, :-1] = x[:, 1:]
+        # last target is next char after the sequence; for simplicity wrap-around
+        y[:, -1] = np.roll(x, -1, axis=1)[:, -1]
+        yield torch.LongTensor(x), torch.LongTensor(y)
+
+
+def sample(model, start_str, stoi, itos, length=200, temp=1.0, device='cpu'):
     model.eval()
-    idx2char = dataset.itos
-    char2idx = dataset.stoi
-    if start_char is None:
-        cur_idx = torch.tensor([[random.randrange(dataset.vocab_size)]], device=device)
-    else:
-        cur_idx = torch.tensor([[char2idx.get(start_char, 0)]], device=device)
-
     hidden = None
-    output = []
-    with torch.no_grad():
-        for _ in range(length):
-            logits, hidden = model(cur_idx, hidden)
-            logits = logits[:, -1, :] / max(1e-8, temp)
-            probs = torch.softmax(logits, dim=-1)
-            next_idx = torch.multinomial(probs, num_samples=1)
-            output.append(idx2char[int(next_idx)])
-            cur_idx = next_idx
-    return ''.join(output)
+    input_ids = torch.LongTensor([[stoi.get(c, 0) for c in start_str]]).to(device)
+    out, hidden = model(input_ids, hidden)
+    last = input_ids[0,-1].unsqueeze(0).unsqueeze(0).to(device)
+    generated = start_str
+    for _ in range(length):
+        logits, hidden = model(last, hidden)
+        logits = logits[:, -1, :] / temp
+        probs = torch.softmax(logits, dim=-1)
+        idx = torch.multinomial(probs, num_samples=1).item()
+        ch = itos[idx]
+        generated += ch
+        last = torch.LongTensor([[idx]]).to(device)
+    return generated
 
-# -------------- Training --------------
-def train_loop(model, dataloader, val_loader, device, epochs=10, lr=1e-3):
-    model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-    train_losses, val_losses = [], []
-
-    for epoch in range(1, epochs+1):
-        model.train()
-        total, acc_loss = 0, 0.0
-        for xb, yb in dataloader:
-            xb, yb = xb.to(device), yb.to(device)
-            optimizer.zero_grad()
-            logits, _ = model(xb)
-            loss = criterion(logits.view(-1, logits.size(-1)), yb.view(-1))
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-            acc_loss += float(loss.item()) * xb.size(0)
-            total += xb.size(0)
-        train_epoch_loss = acc_loss / total
-        train_losses.append(train_epoch_loss)
-
-        # validation
-        model.eval()
-        with torch.no_grad():
-            vtotal, vacc = 0, 0.0
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device), yb.to(device)
-                logits, _ = model(xb)
-                loss = criterion(logits.view(-1, logits.size(-1)), yb.view(-1))
-                vacc += float(loss.item()) * xb.size(0)
-                vtotal += xb.size(0)
-            val_loss = vacc / vtotal if vtotal>0 else 0.0
-            val_losses.append(val_loss)
-
-        print(f"Epoch {epoch}/{epochs} | train_loss={train_epoch_loss:.4f} | val_loss={val_loss:.4f}")
-
-    # plot curves
-    plt.plot(train_losses, label='train')
-    plt.plot(val_losses, label='val')
-    plt.xlabel('epoch'); plt.ylabel('loss'); plt.legend()
-    plt.title('Loss curves')
-    plt.savefig('loss_curves.png')
-    print("Saved loss_curves.png")
-
-# -------------- CLI --------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--data_file', type=str, default=None, help='path to text file')
-    parser.add_argument('--seq_len', type=int, default=50)
-    parser.add_argument('--batch', type=int, default=64)
-    parser.add_argument('--hidden', type=int, default=128)
-    parser.add_argument('--emb', type=int, default=64)
-    parser.add_argument('--epochs', type=int, default=10)
-    args = parser.parse_args()
-
-    if args.data_file is None:
-        toy = "hello hello help helo hello world help me hello!"
-        text = toy * 200  # toy corpus
-    else:
-        with open(args.data_file, 'r', encoding='utf-8') as f:
-            text = f.read()
-
-    # split train/val
-    split = int(0.9 * len(text))
-    train_text = text[:split]
-    val_text = text[split:]
-
-    train_ds = CharDataset(train_text, seq_len=args.seq_len)
-    val_ds = CharDataset(val_text, seq_len=args.seq_len)
-    # ensure same vocab mapping
-    val_ds.stoi = train_ds.stoi
-    val_ds.itos = train_ds.itos
-    val_ds.vocab_size = train_ds.vocab_size
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, drop_last=True)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = CharRNN(train_ds.vocab_size, emb_size=args.emb, hidden_size=args.hidden)
-    train_loop(model, train_loader, val_loader, device, epochs=args.epochs)
-
-    # sampling
-    for temp in [0.7, 1.0, 1.2]:
-        print("=== Sample (temp=", temp, ") ===")
-        print(sample(model, train_ds, device, start_char='h', length=300, temp=temp))
-        print()
 
 if __name__ == '__main__':
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_path', type=str, default=None)
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--seq_len', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--hidden_size', type=int, default=128)
+    parser.add_argument('--emb_size', type=int, default=32)
+    parser.add_argument('--rnn_type', type=str, default='gru')
+    args = parser.parse_args()
+
+    # toy corpus if none provided
+    if args.data_path is None:
+        toy = "hello hello help me hello help hello world\n" * 200  # small toy repeated
+        text = toy
+    else:
+        with open(args.data_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+
+    stoi, itos = build_vocab(text)
+    vocab_size = len(stoi)
+    print('Vocab size:', vocab_size)
+
+    model = CharRNN(vocab_size, emb_size=args.emb_size, hidden_size=args.hidden_size, rnn_type=args.rnn_type)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model.to(device)
+    opt = optim.Adam(model.parameters(), lr=1e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    train_losses = []
+
+    for epoch in range(args.epochs):
+        model.train()
+        total_loss = 0.0
+        batches = 0
+        try:
+            for x, y in create_batches(text, args.seq_len, args.batch_size, stoi):
+                x = x.to(device)
+                y = y.to(device)
+                opt.zero_grad()
+                logits, _ = model(x)
+                # flatten
+                loss = criterion(logits.view(-1, vocab_size), y.view(-1))
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+                batches += 1
+        except ValueError as e:
+            print('Warning:', e)
+            break
+        avg = total_loss / max(1, batches)
+        train_losses.append(avg)
+        print(f'Epoch {epoch+1}/{args.epochs} train loss: {avg:.4f} (batches: {batches})')
+
+    # save loss curve
+    plt.figure()
+    plt.plot(train_losses)
+    plt.xlabel('epoch')
+    plt.ylabel('train_loss')
+    plt.savefig('rnn_train_loss.png')
+    print('Saved training loss to rnn_train_loss.png')
+
+    # sampling at three temperatures
+    temps = [0.7, 1.0, 1.2]
+    with open('rnn_samples.txt', 'w', encoding='utf-8') as f:
+        for t in temps:
+            s = sample(model, start_str='h', stoi=stoi, itos=itos, length=300, temp=t, device=device)
+            f.write(f'Temperature {t}\n')
+            f.write(s + '\n\n')
+    print('Saved samples to rnn_samples.txt')
